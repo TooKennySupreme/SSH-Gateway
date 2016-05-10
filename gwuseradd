@@ -1,0 +1,2 @@
+useradd -m -g wheel -s /sbin/gwshell $1
+passwd $1

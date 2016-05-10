@@ -1,0 +1,153 @@
+#!/bin/bash
+# SSH Gateway v0.1.2
+# Copyright Loading Deck Limited https://www.loadingdeck.com/
+# MIT Licence
+
+SSH_OPTS='-i /etc/sshgateway/id_rsa -o ConnectTimeout=5 -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no'
+
+function mysql_exec(){
+	# Enter your DB credentials here
+	local mysql_db=''
+	local mysql_user=''
+	local mysql_pass=''
+
+	local sql="${1}"
+	# Using -B columns in results are separated with tab
+	local result=$(mysql -u ${mysql_user} -B --password="${mysql_pass}" -e "${sql}" ${mysql_db})
+	# Remove column names from result
+	result=$(echo -e "$result" | sed -n '2,$p')
+	echo "$result";
+}
+
+
+function check_mysql_credentials(){
+	local db_tables=$(mysql_exec "SHOW TABLES")
+	if [ -z "${db_tables}" ]; then
+		dialog --title "MySQL Error" --ok-label "Disconnect" --msgbox "Failed to get database info" 10 30
+		clear;
+		exit 1;
+	fi
+
+	for t in servers users; do
+		if [ $(echo "${db_tables}" | grep -c ${t}) -eq 0 ]; then
+			dialog --title "MySQL Error" --ok-label "Disconnect" --msgbox "Table ${t} is missing" 10 30
+			clear;
+			exit 1;
+		fi
+	done
+}
+
+function display_server_groups(){
+	local username="${1}"
+	local SERVER_GROUP_IDS=$(mysql_exec "SELECT groups FROM users WHERE username='${username}'")
+
+	if [ -z "${SERVER_GROUP_IDS}" ]; then
+		dialog --title "Server groups" --ok-label "Disconnect" --msgbox "No server groups found for user ${username}" 10 30 2>&1 >/dev/tty
+		echo '-1';
+		return;
+	fi
+
+	local SERVER_GROUP_INFO=$(mysql_exec "SELECT id,name FROM groups WHERE id IN (${SERVER_GROUP_IDS})")
+	if [ -z "${SERVER_GROUP_INFO}" ]; then
+		dialog --title "Server groups" --ok-label "Disconnect" --msgbox "No group names found" 10 30 2>&1 >/dev/tty
+		echo '-1';
+		return;
+	fi
+
+	cmd=(dialog --title "Server groups" --clear --ok-label "Show servers" --cancel-label "Exit" --menu "Select a server group" 50 100 50)
+	i=1 n=${#cmd[*]}
+	SAVEIFS="${IFS}"
+	IFS=$'\n'
+	for gr_info in ${SERVER_GROUP_INFO}; do
+		gr_name=$(echo "${gr_info}" | cut -f2)
+		cmd[n++]=$i; cmd[n++]="${gr_name}"
+		let i++;
+	done
+	IFS=${SAVEIFS}
+
+	local SELECTED_ID=$("${cmd[@]}" 2>&1 >/dev/tty)
+	if [ -z "${SELECTED_ID}" ]; then
+		dialog --title "Bye" --timeout 5 --clear --ok-label "Disconnect" --msgbox "You will be disconnected in 5 seconds" 20 50 2>&1 >/dev/tty
+		echo '-1';
+		return;
+	fi
+
+	echo -e "${SERVER_GROUP_INFO}" | sed -n "${SELECTED_ID}p" | cut -f1
+}
+
+function display_servers(){
+	local group_id="${1}"
+	local SERVER_NAMES=$(mysql_exec "SELECT name FROM servers WHERE group_id='${group_id}' ORDER BY name ASC")
+
+	if [ -z "${SERVER_NAMES}" ]; then
+		dialog --title "Servers" --ok-label "Disconnect" --msgbox "No servers found in group ${group_id}" 10 30 2>&1 >/dev/tty
+		echo '-1';
+		return;
+	fi
+
+	cmd=(dialog --title "Servers" --clear --ok-label "Connect" --cancel-label "Back" --menu "Select a server" 50 100 50)
+	i=1 n=${#cmd[*]}
+	SAVEIFS="${IFS}"
+	IFS=$'\n'
+	for name in ${SERVER_NAMES}; do
+		cmd[n++]=$i; cmd[n++]="${name}"
+		let i++;
+	done
+	IFS=${SAVEIFS}
+
+	local SELECTED_ID=$("${cmd[@]}" 2>&1 >/dev/tty)
+	if [ "${SELECTED_ID}" ]; then
+		echo "${SERVER_NAMES}" | sed -n "${SELECTED_ID}p"
+	fi
+}
+
+function ssh_to_server(){
+	local server_name="${1}"
+	local server_details=$(mysql_exec "SELECT ip,ssh_port,ssh_user from servers WHERE name='${server_name}'")
+
+	if [ -z "${server_details}" ]; then
+		dialog --title "Server details" --ok-label "Back" --msgbox "No servers details for ${server_name}" 10 30 2>&1 >/dev/tty
+		return 1;
+	fi
+
+	local SSH_IP=$(echo "${server_details}"   | cut -f1)
+	local SSH_PORT=$(echo "${server_details}" | cut -f2)
+	local SSH_USER=$(echo "${server_details}" | cut -f3)
+	reset;	# Clear terminal screen
+	sudo ssh ${SSH_OPTS} -p${SSH_PORT} ${SSH_USER}@${SSH_IP}
+	local ssh_err=$?
+	if [ ${ssh_err} -ne 0 ]; then
+		dialog --title "SSH Error" --msgbox "SSH returned error code ${ssh_err}" 10 30 2>&1 >/dev/tty
+		return ssh_err;
+	fi
+
+	return $ssh_err;	# Return SSH exit code
+}
+
+# Check if we can login to database and get tables
+check_mysql_credentials;
+
+while [ 1 -eq 1 ]; do
+	SERVER_GROUP_ID=$(display_server_groups ${USER})
+	if [ "${SERVER_GROUP_ID}" == '-1' ]; then
+		break;
+	fi
+
+	if [ -z "${SERVER_GROUP_ID}" ]; then
+		continue;
+	fi
+
+	while [ "${SERVER_GROUP_ID}" ]; do
+		SERVER_NAME=$(display_servers ${SERVER_GROUP_ID})
+		if [ -z "${SERVER_NAME}" ]; then
+			SERVER_GROUP_ID='';	# Clear server group ID
+			continue;
+		fi
+
+		ssh_to_server "${SERVER_NAME}"
+	done
+
+done
+
+echo "Bye ${USER}"
+exit 0;
